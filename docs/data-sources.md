@@ -19,6 +19,7 @@ Initialized once at import time. Used for:
 | SM clock | `nvmlDeviceGetClockInfo(NVML_CLOCK_SM)` | MHz |
 | Compute processes | `nvmlDeviceGetComputeRunningProcesses()` | PID + GPU memory per process |
 | Graphics processes | `nvmlDeviceGetGraphicsRunningProcesses()` | PID + GPU memory per process |
+| Process CPU% | `psutil.Process(pid).cpu_percent(interval=None)` | Non-blocking; returns 0.0 on first call per process |
 
 ### nvidia-smi dmon
 

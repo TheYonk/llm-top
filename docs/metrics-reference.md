@@ -45,6 +45,7 @@ HOST | 11% CPU (20 cores) | 97.3 / 119.7 GiB RAM
 |--------|-------------|
 | **PID** | Linux process ID |
 | **NAME** | Descriptive process name. Worker processes show their argv[0] (e.g., `VLLM::EngineCore`). Launcher processes show `server (model)` format (e.g., `sglang (Qwen3-1.7B)`) |
+| **CPU%** | Process CPU utilization via `psutil`. green <50%, yellow 50-80%, red >80%. Shows 0.0 on first refresh (psutil requires two samples). |
 | **GPU MEM** | GPU memory allocated to this process (GiB/MiB) |
 | **TYPE** | `Compute` or `Graphics` |
 
