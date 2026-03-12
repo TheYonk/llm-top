@@ -191,6 +191,10 @@ def get_gpu_processes() -> list[dict]:
                     )
     except Exception:
         pass
+    # Prune cache entries for PIDs no longer in the GPU process list.
+    live_pids = {p["pid"] for p in procs}
+    for dead in set(_proc_cache) - live_pids:
+        _proc_cache.pop(dead, None)
     return procs
 
 
@@ -227,11 +231,24 @@ def _proc_name(pid: int) -> str:
         return f"<pid {pid}>"
 
 
+_proc_cache: dict[int, psutil.Process] = {}
+
+
 def _proc_cpu(pid: int) -> float | None:
-    """Return CPU% for a process, or None on failure."""
+    """Return CPU% for a process, or None on failure.
+
+    psutil.Process.cpu_percent(interval=None) returns 0 on the first call for
+    a given Process object — it needs two samples to compute a delta.  We cache
+    Process objects by PID so the measurement accumulates across refresh cycles.
+    """
     try:
-        return psutil.Process(pid).cpu_percent(interval=None)
+        proc = _proc_cache.get(pid)
+        if proc is None:
+            proc = psutil.Process(pid)
+            _proc_cache[pid] = proc
+        return proc.cpu_percent(interval=None)
     except Exception:
+        _proc_cache.pop(pid, None)
         return None
 
 
@@ -575,6 +592,7 @@ _PROM_GAUGES = [
 ]
 _PROM_COUNTERS = [
     "request_finish_total",
+    "sglang:num_requests_total",
     "vllm:prompt_tokens_total",
     "vllm:generation_tokens_total",
     "sglang:prompt_tokens_total",
@@ -664,8 +682,10 @@ def scrape_server_metrics(port: int, server_type: str) -> dict:
                         result["gen_throughput"] = val
                     elif name == "sglang:cache_hit_rate":
                         result["cache_hit_rate"] = val
-                    # Shared
+                    # Shared counters
                     elif name == "request_finish_total":
+                        result["total_reqs"] = val
+                    elif name == "sglang:num_requests_total":
                         result["total_reqs"] = val
                 # If Prometheus yielded data, we're done
                 if any(v is not None for v in result.values()):
@@ -673,7 +693,7 @@ def scrape_server_metrics(port: int, server_type: str) -> dict:
         except Exception:
             pass
 
-    # ── SGLang fallback: /get_load (when --enable-metrics is off) ──
+    # ── SGLang fallback: /get_load + /get_server_info (when --enable-metrics is off) ──
     if server_type == "SGLang":
         try:
             r = requests.get(base + "/get_load", timeout=1.5)
@@ -685,6 +705,21 @@ def scrape_server_metrics(port: int, server_type: str) -> dict:
                     d = data
                 result["running"] = d.get("num_reqs")
                 result["pending"] = d.get("num_waiting_reqs")
+        except Exception:
+            pass
+        try:
+            r = requests.get(base + "/get_server_info", timeout=1.5)
+            if r.status_code == 200:
+                d = r.json()
+                # Live stats are nested inside internal_states[0]
+                states = d.get("internal_states", [])
+                inner = states[0] if states else d
+                if "last_gen_throughput" in inner:
+                    result["gen_throughput"] = inner["last_gen_throughput"]
+                mem = inner.get("memory_usage", {})
+                if mem and "token_capacity" in mem:
+                    # Store token capacity for display (not a % yet, but available)
+                    result["_token_capacity"] = mem["token_capacity"]
         except Exception:
             pass
 
