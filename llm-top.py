@@ -597,6 +597,11 @@ _PROM_COUNTERS = [
     "vllm:generation_tokens_total",
     "sglang:prompt_tokens_total",
     "sglang:generation_tokens_total",
+    # Histogram components for latency averages
+    "sglang:time_to_first_token_seconds_sum",
+    "sglang:time_to_first_token_seconds_count",
+    "sglang:e2e_request_latency_seconds_sum",
+    "sglang:e2e_request_latency_seconds_count",
 ]
 
 # Metrics endpoints per server type
@@ -639,6 +644,10 @@ def scrape_server_metrics(port: int, server_type: str) -> dict:
         "gen_tokens": None,
         "gen_throughput": None,
         "cache_hit_rate": None,
+        "ttft_sum": None,
+        "ttft_count": None,
+        "e2e_sum": None,
+        "e2e_count": None,
     }
     base = f"http://localhost:{port}"
 
@@ -682,6 +691,15 @@ def scrape_server_metrics(port: int, server_type: str) -> dict:
                         result["gen_throughput"] = val
                     elif name == "sglang:cache_hit_rate":
                         result["cache_hit_rate"] = val
+                    # SGLang latency histograms
+                    elif name == "sglang:time_to_first_token_seconds_sum":
+                        result["ttft_sum"] = val
+                    elif name == "sglang:time_to_first_token_seconds_count":
+                        result["ttft_count"] = val
+                    elif name == "sglang:e2e_request_latency_seconds_sum":
+                        result["e2e_sum"] = val
+                    elif name == "sglang:e2e_request_latency_seconds_count":
+                        result["e2e_count"] = val
                     # Shared counters
                     elif name == "request_finish_total":
                         result["total_reqs"] = val
@@ -756,6 +774,24 @@ class RateTracker:
         prev_counters[counter_name] = (now, current_value)
         return result
 
+    def delta(self, key: str, counter_name: str, current_value: float | None) -> float | None:
+        """Like rate() but returns the raw delta (not divided by elapsed time).
+
+        Used for histogram avg: delta(sum) / delta(count) gives avg latency over window.
+        Returns None on the first call or if current_value is None.
+        """
+        if current_value is None:
+            return None
+        now = time.time()
+        prev_counters = self._prev.setdefault(key, {})
+        result = None
+        if counter_name in prev_counters:
+            prev_t, prev_v = prev_counters[counter_name]
+            if now - prev_t > 0.5:
+                result = current_value - prev_v
+        prev_counters[counter_name] = (now, current_value)
+        return result
+
 
 # ── Display helpers ───────────────────────────────────────────────────────────
 
@@ -790,6 +826,15 @@ def _color_health(h: str) -> Text:
     if h_lower == "unknown":
         return Text(h, style="yellow")
     return Text(h, style="bold red")
+
+
+def _fmt_latency(seconds: float | None) -> str:
+    """Format a latency value: <1s → ms, else → s."""
+    if seconds is None:
+        return "-"
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    return f"{seconds:.1f}s"
 
 
 def _fmt_rate(bps: float | None) -> str:
@@ -927,6 +972,15 @@ def build_dashboard(refresh_sec: float, tracker: RateTracker | None = None) -> T
                     rates["rps"] = tracker.rate(key, "total_reqs", metrics.get("total_reqs"))
                     rates["prompt_tok_s"] = tracker.rate(key, "prompt_tokens", metrics.get("prompt_tokens"))
                     rates["gen_tok_s"] = tracker.rate(key, "gen_tokens", metrics.get("gen_tokens"))
+                    # Avg TTFT and E2E from histogram sum/count deltas
+                    d_ttft_sum = tracker.delta(key, "ttft_sum", metrics.get("ttft_sum"))
+                    d_ttft_cnt = tracker.delta(key, "ttft_count", metrics.get("ttft_count"))
+                    if d_ttft_cnt and d_ttft_cnt > 0:
+                        rates["ttft_avg"] = d_ttft_sum / d_ttft_cnt
+                    d_e2e_sum = tracker.delta(key, "e2e_sum", metrics.get("e2e_sum"))
+                    d_e2e_cnt = tracker.delta(key, "e2e_count", metrics.get("e2e_count"))
+                    if d_e2e_cnt and d_e2e_cnt > 0:
+                        rates["e2e_avg"] = d_e2e_sum / d_e2e_cnt
                 info["rates"] = rates
                 model_infos.append(info)
 
@@ -1054,6 +1108,8 @@ def build_dashboard(refresh_sec: float, tracker: RateTracker | None = None) -> T
         mt.add_column("RPS", justify="right", width=7)
         mt.add_column("IN/s", justify="right", width=9)
         mt.add_column("OUT/s", justify="right", width=9)
+        mt.add_column("TTFT", justify="right", width=7)
+        mt.add_column("E2E", justify="right", width=7)
         mt.add_column("CONNS", justify="right", width=6)
         for m in model_infos:
             mx = m.get("metrics", {})
@@ -1080,10 +1136,17 @@ def build_dashboard(refresh_sec: float, tracker: RateTracker | None = None) -> T
             in_tok_s = rates.get("prompt_tok_s")
             in_text = _fmt_tok_rate(in_tok_s)
             out_tok_s = rates.get("gen_tok_s")
-            # SGLang provides gen_throughput as a live gauge (tok/s)
-            if out_tok_s is None and mx.get("gen_throughput") is not None:
-                out_tok_s = mx["gen_throughput"]
+            # Prefer SGLang's live gen_throughput gauge over counter-derived rate.
+            # Counter (generation_tokens_total) only ticks on request completion,
+            # so it reads 0 during long in-flight requests.
+            gauge_tps = mx.get("gen_throughput")
+            if gauge_tps is not None and gauge_tps > 0:
+                out_tok_s = gauge_tps
             out_text = _fmt_tok_rate(out_tok_s)
+
+            # Latency averages (windowed from histogram deltas)
+            ttft_text = _fmt_latency(rates.get("ttft_avg"))
+            e2e_text = _fmt_latency(rates.get("e2e_avg"))
 
             mt.add_row(
                 Text(m["server"], style="bold"),
@@ -1097,6 +1160,8 @@ def build_dashboard(refresh_sec: float, tracker: RateTracker | None = None) -> T
                 rps_text,
                 in_text,
                 out_text,
+                ttft_text,
+                e2e_text,
                 str(m["connections"]),
             )
         outer.add_row(mt)
